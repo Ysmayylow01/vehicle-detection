@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import time
+import os
+from datetime import datetime
 import customtkinter as ctk
 from PIL import Image
 
@@ -30,6 +32,13 @@ DOT_COLOR = (0, 255, 0)
 
 # Penjiräniň ölçegi (None bolsa üýtgetmeýär)
 FRAME_RESIZE_WIDTH = None  # meselem: 1280
+
+# Aşyrt tizlige surat ýazga almak sazlamalary
+CAPTURE_DIR = 'captures'
+OVERSPEED_KMH = 70.0
+OVERSPEED_RESET_KMH = 60.0  # histerezis üçin pes aralyk
+CAPTURE_PADDING_PX = 8
+CAPTURE_COOLDOWN_S = 1.0
 
 # Statik aktiwleri öňünden ýükleýäris
 _raw_back_icon = cv2.imread('back_icon.png')
@@ -78,6 +87,44 @@ def _preprocess_frame_for_mask(frame_bgr: np.ndarray, bg_subtractor) -> np.ndarr
     # gözenekleri doldurmak we bitewilik
     fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, kernel, iterations=2)
     return fgmask
+
+
+def _ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _save_overspeed_crop(frame_bgr: np.ndarray, bbox: tuple, track_id: int, speed_kmh: float) -> None:
+    """Tizligi çägden geçen maşynyň bölegini ýazga alýar."""
+    if bbox is None:
+        return
+    x, y, w, h = bbox
+    if w <= 0 or h <= 0:
+        return
+    H, W = frame_bgr.shape[:2]
+    pad = int(CAPTURE_PADDING_PX)
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(W, x + w + pad)
+    y2 = min(H, y + h + pad)
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return
+
+    _ensure_dir(CAPTURE_DIR)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    filename = f"car_{track_id}_{int(round(speed_kmh))}kmh_{timestamp}.jpg"
+    out_path = os.path.join(CAPTURE_DIR, filename)
+    try:
+        cv2.imwrite(out_path, crop)
+    except Exception:
+        # Ýazga almak şowsuz bolsa, dymýar
+        pass
 
 def start_detection():
     """Wideony oka, obýektleri kesgitläp tizligini hasapla we görkez."""
@@ -177,6 +224,17 @@ def start_detection():
             smooth_speed = SPEED_SMOOTH_ALPHA * instant_speed + (1.0 - SPEED_SMOOTH_ALPHA) * prev_smooth
             car_tracks[track_id]['speed_kmh'] = smooth_speed
 
+            # Aşyrt tizlige geçse — birinji gezekde surat ýazga al
+            overspeed_active = car_tracks[track_id].get('overspeed_active', False)
+            now_sec = time.time()
+            last_capture = float(car_tracks[track_id].get('last_capture_time', 0.0))
+            if smooth_speed >= OVERSPEED_KMH and not overspeed_active and (now_sec - last_capture) >= CAPTURE_COOLDOWN_S:
+                _save_overspeed_crop(frame, det_bbox, track_id, smooth_speed)
+                car_tracks[track_id]['overspeed_active'] = True
+                car_tracks[track_id]['last_capture_time'] = now_sec
+            elif smooth_speed <= OVERSPEED_RESET_KMH:
+                car_tracks[track_id]['overspeed_active'] = False
+
             unmatched_track_ids.discard(track_id)
             unmatched_detection_idxs.discard(det_idx)
 
@@ -188,6 +246,8 @@ def start_detection():
                 'bbox': det_bbox,
                 'speed_kmh': 0.0,
                 'frames_since_seen': 0,
+                'overspeed_active': False,
+                'last_capture_time': 0.0,
             }
             next_car_id += 1
 
